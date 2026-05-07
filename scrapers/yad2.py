@@ -1,27 +1,27 @@
 """
-Yad2 scraper.
-
-Strategy: Yad2 has an internal JSON API used by their own frontend
-(https://gw.yad2.co.il/feed-search-legacy/realestate/rent).
-We hit it directly with realistic headers. Falls back to nothing if blocked
-(use a paid proxy in that case - see README).
+Yad2 scraper using curl_cffi to bypass ShieldSquare bot protection.
+Fetches the rendered HTML page and extracts listings from __NEXT_DATA__.
 """
 
+import json
+import re
 import time
 from typing import List, Optional
 
-import requests
+from curl_cffi import requests as cf
 
 from config import (
     MIN_ROOMS, MAX_ROOMS, MIN_PRICE, MAX_PRICE,
-    YAD2_AREA_CODE, NAHARIYA_AREA_CITIES,
-    USER_AGENT, REQUEST_TIMEOUT, DELAY_BETWEEN_REQUESTS,
+    YAD2_SEARCH_BASE, YAD2_MULTI_AREA, YAD2_MULTI_CITY,
+    REQUEST_TIMEOUT, DELAY_BETWEEN_REQUESTS,
     SAFE_ROOM_KEYWORDS,
 )
 from storage import Listing
 
-
-YAD2_API = "https://gw.yad2.co.il/feed-search-legacy/realestate/rent"
+_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+    "Accept-Language": "he-IL,he;q=0.9,en;q=0.8",
+}
 
 
 def _has_safe_room(text: str) -> bool:
@@ -39,45 +39,37 @@ def _safe_int(v) -> Optional[int]:
 
 def _safe_float(v) -> Optional[float]:
     try:
-        return float(v) if v not in (None, "") else None
+        return float(v) if v is not None else None
     except (ValueError, TypeError):
         return None
 
 
-def _build_params(city_code: Optional[int] = None) -> dict:
-    """Build Yad2 API query params."""
-    params = {
-        "rooms": f"{MIN_ROOMS}-{MAX_ROOMS}",
-        "price": f"{MIN_PRICE}-{MAX_PRICE}",
-        "forceLdLoad": "true",
-    }
-    if city_code:
-        params["city"] = city_code
-    else:
-        # search the whole Western Galilee area
-        params["area"] = YAD2_AREA_CODE
-    return params
-
-
-def _fetch_page(params: dict, page: int = 1) -> dict:
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "he-IL,he;q=0.9,en;q=0.8",
-        "Referer": "https://www.yad2.co.il/realestate/rent",
-        "Origin": "https://www.yad2.co.il",
-    }
-    p = dict(params)
-    p["page"] = page
-    r = requests.get(YAD2_API, params=p, headers=headers, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-    return r.json()
+def _find_feed_items(obj, depth: int = 0) -> Optional[list]:
+    """Walk __NEXT_DATA__ tree to find feed_items list."""
+    if depth > 15:
+        return None
+    if isinstance(obj, dict):
+        if "feed_items" in obj:
+            items = obj["feed_items"]
+            if isinstance(items, list) and items:
+                return items
+        for v in obj.values():
+            res = _find_feed_items(v, depth + 1)
+            if res is not None:
+                return res
+    elif isinstance(obj, list):
+        for v in obj:
+            res = _find_feed_items(v, depth + 1)
+            if res is not None:
+                return res
+    return None
 
 
 def _parse_item(item: dict) -> Optional[Listing]:
-    """Parse one Yad2 feed item into a Listing."""
     try:
-        # Yad2 feed items have many possible shapes; we defensively pull fields
+        if item.get("type") not in (None, "ad", ""):
+            return None
+
         title = item.get("title") or item.get("row_1") or ""
         row2 = item.get("row_2") or ""
         row3 = item.get("row_3") or ""
@@ -99,8 +91,6 @@ def _parse_item(item: dict) -> Optional[Listing]:
         url = f"https://www.yad2.co.il/item/{listing_id}"
 
         full_text = f"{title} {description}"
-        has_safe = _has_safe_room(full_text)
-
         return Listing(
             source="yad2",
             title=title or "ללא כותרת",
@@ -110,43 +100,73 @@ def _parse_item(item: dict) -> Optional[Listing]:
             city=city,
             url=url,
             description=description[:500],
-            has_safe_room=has_safe,
+            has_safe_room=_has_safe_room(full_text),
         )
     except Exception:
         return None
 
 
 def fetch_yad2() -> List[Listing]:
-    """Fetch all matching listings from Yad2 across the Western Galilee."""
     results: List[Listing] = []
-    seen_ids = set()
-
-    # Strategy: one broad area search (Western Galilee) covers all towns,
-    # then we filter by city name if needed.
-    params = _build_params(city_code=None)
+    seen_urls: set = set()
 
     try:
-        for page in range(1, 6):  # up to 5 pages = ~150 listings
-            data = _fetch_page(params, page=page)
-            feed = data.get("data", {}).get("feed", {})
-            items = feed.get("feed_items", []) or data.get("feed", {}).get("feed_items", [])
-            if not items:
+        for page in range(1, 6):
+            params = {
+                "maxPrice": MAX_PRICE,
+                "minRooms": MIN_ROOMS,
+                "multiArea": YAD2_MULTI_AREA,
+                "multiCity": YAD2_MULTI_CITY,
+            }
+            if page > 1:
+                params["page"] = page
+
+            r = cf.get(
+                YAD2_SEARCH_BASE,
+                params=params,
+                headers=_HEADERS,
+                impersonate="chrome124",
+                timeout=REQUEST_TIMEOUT,
+            )
+
+            if r.status_code != 200:
+                print(f"[yad2] page {page}: HTTP {r.status_code}")
                 break
+
+            if "ShieldSquare" in r.text:
+                print(f"[yad2] page {page}: captcha hit")
+                break
+
+            m = re.search(r'id="__NEXT_DATA__">(.+?)</script>', r.text)
+            if not m:
+                print(f"[yad2] page {page}: no __NEXT_DATA__")
+                break
+
+            data = json.loads(m.group(1))
+            items = _find_feed_items(data)
+
+            if not items:
+                print(f"[yad2] page {page}: no feed_items")
+                break
+
+            added = 0
             for item in items:
-                if item.get("type") and item["type"] != "ad":
+                if not isinstance(item, dict):
                     continue
                 listing = _parse_item(item)
-                if not listing:
-                    continue
-                if listing.url in seen_ids:
-                    continue
-                seen_ids.add(listing.url)
-                results.append(listing)
-            time.sleep(DELAY_BETWEEN_REQUESTS)
-    except requests.RequestException as e:
-        print(f"[yad2] request failed: {e}")
-    except Exception as e:
-        print(f"[yad2] parse error: {e}")
+                if listing and listing.url not in seen_urls:
+                    seen_urls.add(listing.url)
+                    results.append(listing)
+                    added += 1
 
-    print(f"[yad2] found {len(results)} raw listings")
+            print(f"[yad2] page {page}: {added} listings")
+            if added == 0:
+                break
+
+            time.sleep(DELAY_BETWEEN_REQUESTS)
+
+    except Exception as e:
+        print(f"[yad2] error: {e}")
+
+    print(f"[yad2] total: {len(results)} raw listings")
     return results

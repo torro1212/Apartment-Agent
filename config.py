@@ -47,8 +47,10 @@ FREE_TEXT_LOCATIONS = [
     name for name, code in NAHARIYA_AREA_CITIES.items() if code is None
 ]
 
-# Yad2 area code for "Northern" / Western Galilee
-YAD2_AREA_CODE = 25  # גליל מערבי
+# Yad2 saved-search base URL (coastal north area — from your browser)
+YAD2_SEARCH_BASE = "https://www.yad2.co.il/realestate/rent/coastal-north"
+YAD2_MULTI_AREA = "68"
+YAD2_MULTI_CITY = "9100,0674"
 
 # ===== EMAIL =====
 import os
