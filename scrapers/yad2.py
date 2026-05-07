@@ -134,12 +134,12 @@ def fetch_yad2() -> List[Listing]:
                 break
 
             if "ShieldSquare" in r.text:
-                print(f"[yad2] page {page}: captcha hit")
+                print(f"[yad2] page {page}: captcha hit — first 300: {r.text[:300]}")
                 break
 
             m = re.search(r'id="__NEXT_DATA__">(.+?)</script>', r.text)
             if not m:
-                print(f"[yad2] page {page}: no __NEXT_DATA__")
+                print(f"[yad2] page {page}: no __NEXT_DATA__ — status={r.status_code} first300={r.text[:300]!r}")
                 break
 
             data = json.loads(m.group(1))
